@@ -178,6 +178,48 @@ impl CompactCStr8 {
     pub unsafe fn from_utf8_with_nul_unchecked(bytes: &[u8]) -> Self {
         Self::from_cstr8(CStr8::from_utf8_with_nul_unchecked(bytes))
     }
+
+    /// Creates a `CompactCStr8` from a raw NUL-terminated C string pointer.
+    ///
+    /// Reads bytes up to the first NUL, validates UTF-8, and stores inline
+    /// if short enough. No interior NUL bytes are possible since
+    /// [`CStr::from_ptr`] stops at the first NUL.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must reference a valid NUL-terminated byte sequence,
+    /// and the chosen lifetime must not outlive the allocation.
+    /// (The data is copied, so the pointer need only be valid for
+    /// the duration of this call.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CStr8Error`] if the bytes before the NUL terminator are
+    /// not valid UTF-8.
+    pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, CStr8Error> {
+        let cstr = core::ffi::CStr::from_ptr(ptr.cast());
+        let bytes = cstr.to_bytes(); // without NUL
+                                     // Validate UTF-8.
+        core::str::from_utf8(bytes)?;
+        // No interior NUL possible — CStr stops at the first NUL.
+        // Inline if short enough, otherwise Arc.
+        if bytes.len() <= MAX_INLINE_LEN {
+            let mut buf = [0u8; INLINE_BUF];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            // buf[bytes.len()] is already 0 (NUL terminator).
+            Ok(CompactCStr8 {
+                repr: Repr::Inline {
+                    buf,
+                    len: bytes.len() as u8,
+                },
+            })
+        } else {
+            // bytes_with_nul is valid UTF-8 + NUL (validated above, no interior NULs).
+            Ok(Self::from_cstr8(CStr8::from_utf8_with_nul_unchecked(
+                cstr.to_bytes_with_nul(),
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +671,63 @@ mod tests {
     }
 
     #[test]
+    fn from_ptr_short_inline() {
+        let s = unsafe { CompactCStr8::from_ptr(b"chr1\0".as_ptr()) }.unwrap();
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "chr1");
+        assert_eq!(s.as_bytes_with_nul(), b"chr1\0");
+    }
+
+    #[test]
+    fn from_ptr_empty() {
+        let s = unsafe { CompactCStr8::from_ptr(b"\0".as_ptr()) }.unwrap();
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn from_ptr_max_inline() {
+        let input = b"aaaaaaaaaaaaaaaaaaaaa\0"; // 21 + NUL
+        let s = unsafe { CompactCStr8::from_ptr(input.as_ptr()) }.unwrap();
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "aaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn from_ptr_arc_path() {
+        let input = b"aaaaaaaaaaaaaaaaaaaaaa\0"; // 22 + NUL
+        let s = unsafe { CompactCStr8::from_ptr(input.as_ptr()) }.unwrap();
+        assert!(!s.is_inline());
+        assert_eq!(s.as_str(), "aaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn from_ptr_rejects_invalid_utf8() {
+        let input = b"\xff\xfe\0";
+        assert!(unsafe { CompactCStr8::from_ptr(input.as_ptr()) }.is_err());
+    }
+
+    #[test]
+    fn from_ptr_stops_at_first_nul() {
+        // Interior NUL acts as terminator, not an error
+        let input = b"hello\0world\0";
+        let s = unsafe { CompactCStr8::from_ptr(input.as_ptr()) }.unwrap();
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn from_ptr_matches_from_utf8() {
+        for input in &["", "x", "chr1", "CHROMOSOME_I", "aaaaaaaaaaaaaaaaaaaaa"] {
+            let mut buf = input.as_bytes().to_vec();
+            buf.push(0);
+            let from_ptr = unsafe { CompactCStr8::from_ptr(buf.as_ptr()) }.unwrap();
+            let from_utf8 = CompactCStr8::from_utf8(input.as_bytes()).unwrap();
+            assert_eq!(from_ptr, from_utf8);
+            assert_eq!(from_ptr.is_inline(), from_utf8.is_inline());
+        }
+    }
+
+    #[test]
     fn error_interior_nul() {
         assert!(CompactCStr8::new("has\0nul").is_err());
     }
@@ -868,6 +967,36 @@ mod tests {
             #[test]
             fn from_utf8_inline_threshold(s in valid_str()) {
                 let compact = CompactCStr8::from_utf8(s.as_bytes()).unwrap();
+                if s.len() <= MAX_INLINE_LEN {
+                    prop_assert!(compact.is_inline());
+                } else {
+                    prop_assert!(!compact.is_inline());
+                }
+            }
+
+            #[test]
+            fn from_ptr_roundtrip(s in valid_str()) {
+                let mut buf = s.clone().into_bytes();
+                buf.push(0);
+                let compact = unsafe { CompactCStr8::from_ptr(buf.as_ptr()) }.unwrap();
+                prop_assert_eq!(compact.as_str(), s.as_str());
+            }
+
+            #[test]
+            fn from_ptr_matches_new(s in valid_str()) {
+                let mut buf = s.clone().into_bytes();
+                buf.push(0);
+                let from_ptr = unsafe { CompactCStr8::from_ptr(buf.as_ptr()) }.unwrap();
+                let from_new = CompactCStr8::new(&s).unwrap();
+                prop_assert_eq!(from_ptr.is_inline(), from_new.is_inline());
+                prop_assert_eq!(from_ptr, from_new);
+            }
+
+            #[test]
+            fn from_ptr_inline_threshold(s in valid_str()) {
+                let mut buf = s.clone().into_bytes();
+                buf.push(0);
+                let compact = unsafe { CompactCStr8::from_ptr(buf.as_ptr()) }.unwrap();
                 if s.len() <= MAX_INLINE_LEN {
                     prop_assert!(compact.is_inline());
                 } else {
