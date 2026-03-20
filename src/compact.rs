@@ -117,6 +117,46 @@ impl CompactCStr8 {
         Ok(Self::from_cstr8(&cs))
     }
 
+    /// Creates a `CompactCStr8` from a byte slice.
+    ///
+    /// The bytes must be valid UTF-8 and must not contain NUL bytes.
+    /// A NUL terminator is appended automatically. For short strings
+    /// (≤ 21 bytes) this is entirely stack-allocated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CStr8Error`] if the input is not valid UTF-8 or contains
+    /// a NUL byte.
+    pub fn from_utf8(bytes: &[u8]) -> Result<Self, CStr8Error> {
+        let s = core::str::from_utf8(bytes)?;
+        // Check for interior NUL bytes and construct inline if possible.
+        if bytes.len() <= MAX_INLINE_LEN {
+            let mut buf = [0u8; INLINE_BUF];
+            // Scan for interior NUL while copying.
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == 0 {
+                    return Err(CStr8Error::NulError(
+                        core::ffi::CStr::from_bytes_with_nul(b"\0\0").unwrap_err(),
+                    ));
+                }
+                buf[i] = b;
+            }
+            // buf[bytes.len()] is already 0 from zero-init (NUL terminator).
+            Ok(CompactCStr8 {
+                repr: Repr::Inline {
+                    buf,
+                    len: bytes.len() as u8,
+                },
+            })
+        } else {
+            // Heap path: delegate to CString8 which handles NUL checking.
+            let cs = CString8::new(s).map_err(|_| {
+                CStr8Error::NulError(core::ffi::CStr::from_bytes_with_nul(b"\0\0").unwrap_err())
+            })?;
+            Ok(Self::from_cstr8(&cs))
+        }
+    }
+
     /// Creates a `CompactCStr8` from a byte slice that must be valid UTF-8
     /// and nul-terminated (with no interior NUL bytes).
     ///
@@ -535,6 +575,60 @@ mod tests {
     }
 
     #[test]
+    fn from_utf8_short_inline() {
+        let s = CompactCStr8::from_utf8(b"chr1").unwrap();
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "chr1");
+        assert_eq!(s.as_bytes_with_nul(), b"chr1\0");
+    }
+
+    #[test]
+    fn from_utf8_empty() {
+        let s = CompactCStr8::from_utf8(b"").unwrap();
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn from_utf8_max_inline() {
+        let input = b"aaaaaaaaaaaaaaaaaaaaa"; // 21 bytes
+        assert_eq!(input.len(), MAX_INLINE_LEN);
+        let s = CompactCStr8::from_utf8(input).unwrap();
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "aaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn from_utf8_arc_path() {
+        let input = b"aaaaaaaaaaaaaaaaaaaaaa"; // 22 bytes
+        assert_eq!(input.len(), MAX_INLINE_LEN + 1);
+        let s = CompactCStr8::from_utf8(input).unwrap();
+        assert!(!s.is_inline());
+        assert_eq!(s.as_str(), "aaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn from_utf8_rejects_interior_nul() {
+        assert!(CompactCStr8::from_utf8(b"has\0nul").is_err());
+    }
+
+    #[test]
+    fn from_utf8_rejects_invalid_utf8() {
+        assert!(CompactCStr8::from_utf8(b"\xff\xfe").is_err());
+    }
+
+    #[test]
+    fn from_utf8_matches_new() {
+        // from_utf8 and new should produce identical results
+        for input in &["", "x", "chr1", "CHROMOSOME_I", "aaaaaaaaaaaaaaaaaaaaa"] {
+            let from_new = CompactCStr8::new(input).unwrap();
+            let from_utf8 = CompactCStr8::from_utf8(input.as_bytes()).unwrap();
+            assert_eq!(from_new, from_utf8);
+            assert_eq!(from_new.is_inline(), from_utf8.is_inline());
+        }
+    }
+
+    #[test]
     fn error_interior_nul() {
         assert!(CompactCStr8::new("has\0nul").is_err());
     }
@@ -755,6 +849,30 @@ mod tests {
                 bytes.push(0);
                 let compact = CompactCStr8::from_utf8_with_nul(&bytes).unwrap();
                 prop_assert_eq!(compact.as_bytes_with_nul(), bytes.as_slice());
+            }
+
+            #[test]
+            fn from_utf8_roundtrip(s in valid_str()) {
+                let compact = CompactCStr8::from_utf8(s.as_bytes()).unwrap();
+                prop_assert_eq!(compact.as_str(), s.as_str());
+            }
+
+            #[test]
+            fn from_utf8_matches_new(s in valid_str()) {
+                let from_new = CompactCStr8::new(&s).unwrap();
+                let from_utf8 = CompactCStr8::from_utf8(s.as_bytes()).unwrap();
+                prop_assert_eq!(from_new.is_inline(), from_utf8.is_inline());
+                prop_assert_eq!(from_new, from_utf8);
+            }
+
+            #[test]
+            fn from_utf8_inline_threshold(s in valid_str()) {
+                let compact = CompactCStr8::from_utf8(s.as_bytes()).unwrap();
+                if s.len() <= MAX_INLINE_LEN {
+                    prop_assert!(compact.is_inline());
+                } else {
+                    prop_assert!(!compact.is_inline());
+                }
             }
 
             #[test]
