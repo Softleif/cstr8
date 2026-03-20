@@ -15,6 +15,9 @@ mod macros;
 #[cfg(feature = "alloc")]
 mod buf;
 
+#[cfg(feature = "alloc")]
+mod compact;
+
 mod slice;
 
 #[cfg(test)]
@@ -22,5 +25,8 @@ mod tests;
 
 #[cfg(feature = "alloc")]
 pub use self::buf::*;
+
+#[cfg(feature = "alloc")]
+pub use self::compact::*;
 
 pub use self::{macros::*, slice::*};
