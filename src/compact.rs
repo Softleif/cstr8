@@ -359,6 +359,32 @@ impl From<CompactCStr8> for CString8 {
     }
 }
 
+impl TryFrom<&str> for CompactCStr8 {
+    type Error = CStr8Error;
+
+    /// Converts a `&str` into a `CompactCStr8`.
+    ///
+    /// Equivalent to [`CompactCStr8::new`] but uses the standard
+    /// `TryFrom` trait. Fails if the string contains interior NUL bytes.
+    #[inline]
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::from_utf8(s.as_bytes())
+    }
+}
+
+impl TryFrom<&[u8]> for CompactCStr8 {
+    type Error = CStr8Error;
+
+    /// Converts a `&[u8]` into a `CompactCStr8`.
+    ///
+    /// Equivalent to [`CompactCStr8::from_utf8`]. Fails if the bytes
+    /// are not valid UTF-8 or contain NUL bytes.
+    #[inline]
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_utf8(bytes)
+    }
+}
+
 impl From<CompactCStr8> for Arc<CStr8> {
     #[inline]
     fn from(s: CompactCStr8) -> Arc<CStr8> {
