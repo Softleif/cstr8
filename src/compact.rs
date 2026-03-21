@@ -73,7 +73,7 @@ impl CompactCStr8 {
 
     /// Returns `true` if the string is stored inline (no heap allocation).
     #[inline]
-    pub fn is_inline(&self) -> bool {
+    pub const fn is_inline(&self) -> bool {
         matches!(self.repr, Repr::Inline { .. })
     }
 }
@@ -105,6 +105,80 @@ impl CompactCStr8 {
             }
         }
     }
+
+    /// Creates a `CompactCStr8` from a string literal in const context.
+    ///
+    /// A NUL terminator is appended automatically.
+    ///
+    /// # Panics
+    ///
+    /// Panics (at compile time if used in const context) if the string
+    /// is longer than 21 bytes or contains interior NUL bytes.
+    /// For fallible construction, use [`new`](Self::new) instead.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use cstr8::CompactCStr8;
+    ///
+    /// const CHR1: CompactCStr8 = CompactCStr8::new_inline("chr1");
+    /// assert_eq!(CHR1.as_str(), "chr1");
+    /// assert!(CHR1.is_inline());
+    /// ```
+    #[inline]
+    pub const fn new_inline(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        assert!(
+            bytes.len() <= MAX_INLINE_LEN,
+            "string exceeds inline capacity (max 21 bytes)"
+        );
+        let mut buf = [0u8; INLINE_BUF];
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(bytes[i] != 0, "string contains interior NUL byte");
+            buf[i] = bytes[i];
+            i += 1;
+        }
+        // buf[bytes.len()] is already 0 (NUL terminator).
+        CompactCStr8 {
+            repr: Repr::Inline {
+                buf,
+                len: bytes.len() as u8,
+            },
+        }
+    }
+
+    /// Creates a `CompactCStr8` from a [`CStr8`] in const context.
+    ///
+    /// # Panics
+    ///
+    /// Panics (at compile time if used in const context) if the string
+    /// is longer than 21 bytes. For strings that may be longer, use
+    /// [`from_cstr8`](Self::from_cstr8) instead.
+    #[inline]
+    pub const fn from_cstr8_inline(s: &CStr8) -> Self {
+        let src = s.as_bytes_with_nul();
+        let str_len = src.len() - 1; // subtract NUL
+        assert!(
+            str_len <= MAX_INLINE_LEN,
+            "string exceeds inline capacity (max 21 bytes)"
+        );
+        let mut buf = [0u8; INLINE_BUF];
+        let mut i = 0;
+        while i < str_len + 1 {
+            buf[i] = src[i];
+            i += 1;
+        }
+        CompactCStr8 {
+            repr: Repr::Inline {
+                buf,
+                len: str_len as u8,
+            },
+        }
+    }
+
+    /// An empty `CompactCStr8`, usable in const context.
+    pub const EMPTY: Self = Self::new_inline("");
 
     /// Creates a `CompactCStr8` from a string slice.
     ///
@@ -415,12 +489,7 @@ impl fmt::Debug for CompactCStr8 {
 impl Default for CompactCStr8 {
     #[inline]
     fn default() -> Self {
-        CompactCStr8 {
-            repr: Repr::Inline {
-                buf: [0u8; INLINE_BUF],
-                len: 0,
-            },
-        }
+        Self::EMPTY
     }
 }
 
@@ -476,11 +545,8 @@ impl PartialEq<CompactCStr8> for CStr8 {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use crate::CStr8;
     use {
         super::*,
-        crate::cstr8,
         alloc::{borrow::ToOwned, collections::BTreeMap, vec},
     };
 
@@ -499,6 +565,42 @@ mod tests {
         assert_eq!(s.as_str(), "");
         assert_eq!(s.as_bytes_with_nul(), b"\0");
         assert_eq!(s.as_c_str(), c"");
+    }
+
+    #[test]
+    fn const_empty() {
+        const EMPTY: CompactCStr8 = CompactCStr8::EMPTY;
+        assert!(EMPTY.is_inline());
+        assert_eq!(EMPTY.as_str(), "");
+    }
+
+    #[test]
+    fn const_new_inline() {
+        const CHR1: CompactCStr8 = CompactCStr8::new_inline("chr1");
+        assert!(CHR1.is_inline());
+        assert_eq!(CHR1.as_str(), "chr1");
+        assert_eq!(CHR1.as_bytes_with_nul(), b"chr1\0");
+    }
+
+    #[test]
+    fn const_new_inline_max() {
+        const MAX: CompactCStr8 = CompactCStr8::new_inline("aaaaaaaaaaaaaaaaaaaaa"); // 21 'a's
+        assert!(MAX.is_inline());
+        assert_eq!(MAX.as_str().len(), MAX_INLINE_LEN);
+    }
+
+    #[test]
+    fn const_from_cstr8_inline() {
+        const S: CompactCStr8 = CompactCStr8::from_cstr8_inline(cstr8!("hello"));
+        assert!(S.is_inline());
+        assert_eq!(S.as_str(), "hello");
+    }
+
+    #[test]
+    fn const_new_inline_matches_new() {
+        const INLINE: CompactCStr8 = CompactCStr8::new_inline("chr1");
+        let runtime = CompactCStr8::new("chr1").unwrap();
+        assert_eq!(INLINE, runtime);
     }
 
     #[test]

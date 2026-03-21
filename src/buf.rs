@@ -242,7 +242,7 @@ impl CString8 {
 /// An error converting to [`CString8`].
 ///
 /// If multiple errors apply, which one you get back is unspecified.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CString8Error {
     /// The string is not valid UTF-8.
     InvalidUtf8(FromUtf8Error),

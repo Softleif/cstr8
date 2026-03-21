@@ -263,12 +263,6 @@ mod alloc_impls {
             // trailing NUL and no interior NULs (CStr8 invariant).
             unsafe { CString8::from_vec_with_nul_unchecked(self.as_bytes_with_nul().to_owned()) }
         }
-
-        // fn clone_into(&self, target: &mut CString8) {
-        //     let mut b = mem::take(target).into_bytes_with_nul();
-        //     self.as_bytes_with_nul().clone_into(&mut b);
-        //     *target = unsafe { CString8::from_vec_unchecked(b) }
-        // }
     }
 }
 
@@ -451,9 +445,13 @@ impl CStr8 {
     /// let sparkle_heart = vec![0, 240, 159, 146, 150, 0];
     /// assert!(CStr8::from_utf8_with_nul(&sparkle_heart).is_err());
     /// ```
-    pub fn from_utf8_with_nul(v: &[u8]) -> Result<&CStr8, CStr8Error> {
-        let _ = str::from_utf8(v)?;
-        let _ = CStr::from_bytes_with_nul(v)?;
+    pub const fn from_utf8_with_nul(v: &[u8]) -> Result<&CStr8, CStr8Error> {
+        if let Err(e) = str::from_utf8(v) {
+            return Err(CStr8Error::InvalidUtf8(e));
+        }
+        if let Err(e) = CStr::from_bytes_with_nul(v) {
+            return Err(CStr8Error::NulError(e));
+        }
         Ok(unsafe { CStr8::from_utf8_with_nul_unchecked(v) })
     }
 
@@ -484,10 +482,20 @@ impl CStr8 {
     /// assert_eq!(c_str, "AAAAAAAA");
     /// # Ok::<_, cstr8::CStr8Error>(())
     /// ```
-    pub fn from_utf8_until_nul(v: &[u8]) -> Result<&CStr8, CStr8Error> {
-        let v = CStr::from_bytes_until_nul(v)
-            .map(CStr::to_bytes_with_nul)
-            .unwrap_or_default();
+    pub const fn from_utf8_until_nul(v: &[u8]) -> Result<&CStr8, CStr8Error> {
+        let v = match CStr::from_bytes_until_nul(v) {
+            Ok(cstr) => cstr.to_bytes_with_nul(),
+            Err(_) => {
+                return Err(CStr8Error::NulError(
+                    // No NUL byte found — reuse from_bytes_with_nul to produce
+                    // the correct FromBytesWithNulError.
+                    match CStr::from_bytes_with_nul(v) {
+                        Err(e) => e,
+                        Ok(_) => unreachable!(),
+                    },
+                ));
+            },
+        };
         Self::from_utf8_with_nul(v)
     }
 
@@ -515,7 +523,7 @@ impl CStr8 {
 /// An error converting to [`CStr8`].
 ///
 /// If multiple errors apply, which one you get back is unspecified.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CStr8Error {
     /// The string is not valid UTF-8.
     InvalidUtf8(Utf8Error),
