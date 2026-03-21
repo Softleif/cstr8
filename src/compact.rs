@@ -417,7 +417,15 @@ impl From<&CStr8> for CompactCStr8 {
 impl From<CString8> for CompactCStr8 {
     #[inline]
     fn from(s: CString8) -> Self {
-        Self::from_cstr8(&s)
+        if s.as_bytes().len() <= MAX_INLINE_LEN {
+            Self::from_cstr8(&s)
+        } else {
+            // Reuse CString8's heap allocation as an Arc directly,
+            // avoiding a copy.
+            CompactCStr8 {
+                repr: Repr::Arc(Arc::from(s)),
+            }
+        }
     }
 }
 
@@ -426,7 +434,7 @@ impl From<CompactCStr8> for CString8 {
     fn from(s: CompactCStr8) -> Self {
         // SAFETY: as_bytes_with_nul() is valid UTF-8 with exactly one
         // trailing NUL and no interior NULs (CStr8 invariant).
-        unsafe { CString8::from_vec_with_nul_unchecked(s.as_cstr8().as_bytes_with_nul().to_vec()) }
+        unsafe { CString8::from_vec_with_nul_unchecked(s.as_bytes_with_nul().to_vec()) }
     }
 }
 
@@ -536,6 +544,117 @@ impl PartialEq<CompactCStr8> for CStr8 {
     #[inline]
     fn eq(&self, other: &CompactCStr8) -> bool {
         self == other.as_cstr8()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-type PartialOrd
+// ---------------------------------------------------------------------------
+
+impl PartialOrd<str> for CompactCStr8 {
+    #[inline]
+    fn partial_cmp(&self, other: &str) -> Option<cmp::Ordering> {
+        self.as_str().partial_cmp(other)
+    }
+}
+
+impl PartialOrd<CompactCStr8> for str {
+    #[inline]
+    fn partial_cmp(&self, other: &CompactCStr8) -> Option<cmp::Ordering> {
+        self.partial_cmp(other.as_str())
+    }
+}
+
+impl PartialOrd<CStr> for CompactCStr8 {
+    #[inline]
+    fn partial_cmp(&self, other: &CStr) -> Option<cmp::Ordering> {
+        self.as_c_str().partial_cmp(other)
+    }
+}
+
+impl PartialOrd<CompactCStr8> for CStr {
+    #[inline]
+    fn partial_cmp(&self, other: &CompactCStr8) -> Option<cmp::Ordering> {
+        self.partial_cmp(other.as_c_str())
+    }
+}
+
+impl PartialOrd<CStr8> for CompactCStr8 {
+    #[inline]
+    fn partial_cmp(&self, other: &CStr8) -> Option<cmp::Ordering> {
+        self.as_cstr8().partial_cmp(other)
+    }
+}
+
+impl PartialOrd<CompactCStr8> for CStr8 {
+    #[inline]
+    fn partial_cmp(&self, other: &CompactCStr8) -> Option<cmp::Ordering> {
+        self.partial_cmp(other.as_cstr8())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// std-gated impls
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "std")]
+mod std_impls {
+    use super::*;
+
+    impl AsRef<std::ffi::OsStr> for CompactCStr8 {
+        #[inline]
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.as_str().as_ref()
+        }
+    }
+
+    impl AsRef<std::path::Path> for CompactCStr8 {
+        #[inline]
+        fn as_ref(&self) -> &std::path::Path {
+            self.as_str().as_ref()
+        }
+    }
+
+    impl PartialEq<std::string::String> for CompactCStr8 {
+        #[inline]
+        fn eq(&self, other: &std::string::String) -> bool {
+            self.as_str() == other.as_str()
+        }
+    }
+
+    impl PartialEq<CompactCStr8> for std::string::String {
+        #[inline]
+        fn eq(&self, other: &CompactCStr8) -> bool {
+            self.as_str() == other.as_str()
+        }
+    }
+
+    impl PartialEq<std::ffi::OsStr> for CompactCStr8 {
+        #[inline]
+        fn eq(&self, other: &std::ffi::OsStr) -> bool {
+            self.as_str() == other
+        }
+    }
+
+    impl PartialEq<CompactCStr8> for std::ffi::OsStr {
+        #[inline]
+        fn eq(&self, other: &CompactCStr8) -> bool {
+            self == other.as_str()
+        }
+    }
+
+    impl PartialEq<std::ffi::OsString> for CompactCStr8 {
+        #[inline]
+        fn eq(&self, other: &std::ffi::OsString) -> bool {
+            self.as_str() == other
+        }
+    }
+
+    impl PartialEq<CompactCStr8> for std::ffi::OsString {
+        #[inline]
+        fn eq(&self, other: &CompactCStr8) -> bool {
+            self == other.as_str()
+        }
     }
 }
 
@@ -676,6 +795,15 @@ mod tests {
     }
 
     #[test]
+    fn from_cstring8_long_reuses_allocation() {
+        let input = "a_long_string_that_definitely_exceeds_inline";
+        let cs = CString8::new(input).unwrap();
+        let s = CompactCStr8::from(cs);
+        assert!(!s.is_inline());
+        assert_eq!(s.as_str(), input);
+    }
+
+    #[test]
     fn into_cstring8() {
         let s = CompactCStr8::new("test").unwrap();
         let cs: CString8 = s.into();
@@ -690,6 +818,32 @@ mod tests {
         let arc: Arc<CStr8> = s.into();
         // The Arc should reuse the same allocation
         assert_eq!(arc.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn partial_ord_cross_type() {
+        let s = CompactCStr8::new("bbb").unwrap();
+        assert!(s > *"aaa");
+        assert!(*"aaa" < s);
+        assert!(s > *c"aaa");
+        assert!(*c"aaa" < s);
+        assert!(s > *cstr8!("aaa"));
+        assert!(*cstr8!("aaa") < s);
+    }
+
+    #[test]
+    fn partial_eq_string() {
+        let s = CompactCStr8::new("hello").unwrap();
+        let owned = std::string::String::from("hello");
+        assert!(s == owned);
+        assert!(owned == s);
+    }
+
+    #[test]
+    fn as_ref_os_str_and_path() {
+        let s = CompactCStr8::new("test").unwrap();
+        let _: &std::ffi::OsStr = s.as_ref();
+        let _: &std::path::Path = s.as_ref();
     }
 
     #[test]
