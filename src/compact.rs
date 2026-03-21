@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use core::{
     borrow::Borrow,
@@ -38,6 +38,7 @@ pub struct CompactCStr8 {
     repr: Repr,
 }
 
+#[derive(Clone)]
 enum Repr {
     /// Inline storage. `buf[..len]` is the string content (valid UTF-8,
     /// no interior NUL bytes). `buf[len]` is the NUL terminator.
@@ -48,6 +49,7 @@ enum Repr {
     Arc(Arc<CStr8>),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(mem::size_of::<CompactCStr8>() == 24);
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ impl CompactCStr8 {
     ///
     /// Strings of 21 bytes or fewer are stored inline; longer strings
     /// are placed behind an [`Arc`].
+    #[inline]
     pub fn from_cstr8(s: &CStr8) -> Self {
         let str_len = s.as_bytes().len(); // without NUL
         if str_len <= MAX_INLINE_LEN {
@@ -110,11 +113,10 @@ impl CompactCStr8 {
     ///
     /// # Errors
     ///
-    /// Returns [`NulError`](alloc::ffi::NulError) if the input contains
-    /// interior NUL bytes.
-    pub fn new(s: &str) -> Result<Self, alloc::ffi::NulError> {
-        let cs = CString8::new(s)?;
-        Ok(Self::from_cstr8(&cs))
+    /// Returns [`CStr8Error`] if the input contains interior NUL bytes.
+    #[inline]
+    pub fn new(s: &str) -> Result<Self, CStr8Error> {
+        Self::from_utf8(s.as_bytes())
     }
 
     /// Creates a `CompactCStr8` from a byte slice.
@@ -127,21 +129,16 @@ impl CompactCStr8 {
     ///
     /// Returns [`CStr8Error`] if the input is not valid UTF-8 or contains
     /// a NUL byte.
+    #[inline]
     pub fn from_utf8(bytes: &[u8]) -> Result<Self, CStr8Error> {
-        let s = core::str::from_utf8(bytes)?;
-        // Check for interior NUL bytes and construct inline if possible.
+        core::str::from_utf8(bytes)?;
         if bytes.len() <= MAX_INLINE_LEN {
             let mut buf = [0u8; INLINE_BUF];
-            // Scan for interior NUL while copying.
-            for (i, &b) in bytes.iter().enumerate() {
-                if b == 0 {
-                    return Err(CStr8Error::NulError(
-                        core::ffi::CStr::from_bytes_with_nul(b"\0\0").unwrap_err(),
-                    ));
-                }
-                buf[i] = b;
-            }
+            buf[..bytes.len()].copy_from_slice(bytes);
             // buf[bytes.len()] is already 0 from zero-init (NUL terminator).
+            // Validate no interior NUL — CStr::from_bytes_with_nul will
+            // report the actual position of any interior NUL byte.
+            CStr::from_bytes_with_nul(&buf[..bytes.len() + 1])?;
             Ok(CompactCStr8 {
                 repr: Repr::Inline {
                     buf,
@@ -149,10 +146,14 @@ impl CompactCStr8 {
                 },
             })
         } else {
-            // Heap path: delegate to CString8 which handles NUL checking.
-            let cs = CString8::new(s).map_err(|_| {
-                CStr8Error::NulError(core::ffi::CStr::from_bytes_with_nul(b"\0\0").unwrap_err())
-            })?;
+            // Heap path: build bytes-with-nul once, validate, then construct.
+            let mut bytes_with_nul = Vec::with_capacity(bytes.len() + 1);
+            bytes_with_nul.extend_from_slice(bytes);
+            bytes_with_nul.push(0);
+            CStr::from_bytes_with_nul(&bytes_with_nul)?;
+            // SAFETY: valid UTF-8 (checked above), exactly one NUL at end
+            // (CStr check passed), no interior NULs.
+            let cs = unsafe { CString8::from_vec_with_nul_unchecked(bytes_with_nul) };
             Ok(Self::from_cstr8(&cs))
         }
     }
@@ -164,6 +165,7 @@ impl CompactCStr8 {
     ///
     /// Returns [`CStr8Error`] if the input is not valid UTF-8 or does not
     /// have exactly one NUL byte at the end.
+    #[inline]
     pub fn from_utf8_with_nul(bytes: &[u8]) -> Result<Self, CStr8Error> {
         let s = CStr8::from_utf8_with_nul(bytes)?;
         Ok(Self::from_cstr8(s))
@@ -175,6 +177,7 @@ impl CompactCStr8 {
     ///
     /// The provided bytes must be valid UTF-8, nul-terminated, and not
     /// contain any interior NUL bytes.
+    #[inline]
     pub unsafe fn from_utf8_with_nul_unchecked(bytes: &[u8]) -> Self {
         Self::from_cstr8(CStr8::from_utf8_with_nul_unchecked(bytes))
     }
@@ -196,6 +199,7 @@ impl CompactCStr8 {
     ///
     /// Returns [`CStr8Error`] if the bytes before the NUL terminator are
     /// not valid UTF-8.
+    #[inline]
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, CStr8Error> {
         let cstr = core::ffi::CStr::from_ptr(ptr.cast());
         let bytes = cstr.to_bytes(); // without NUL
@@ -243,13 +247,7 @@ impl Clone for CompactCStr8 {
     #[inline]
     fn clone(&self) -> Self {
         CompactCStr8 {
-            repr: match &self.repr {
-                Repr::Inline { buf, len } => Repr::Inline {
-                    buf: *buf,
-                    len: *len,
-                },
-                Repr::Arc(arc) => Repr::Arc(Arc::clone(arc)),
-            },
+            repr: self.repr.clone(),
         }
     }
 }
@@ -352,9 +350,8 @@ impl From<CString8> for CompactCStr8 {
 impl From<CompactCStr8> for CString8 {
     #[inline]
     fn from(s: CompactCStr8) -> Self {
-        // Use from_vec_with_nul_unchecked to avoid the double-NUL issue
-        // in CStr8's ToOwned impl (which passes bytes_with_nul to
-        // from_vec_unchecked, which appends another NUL).
+        // SAFETY: as_bytes_with_nul() is valid UTF-8 with exactly one
+        // trailing NUL and no interior NULs (CStr8 invariant).
         unsafe { CString8::from_vec_with_nul_unchecked(s.as_cstr8().as_bytes_with_nul().to_vec()) }
     }
 }
@@ -364,8 +361,8 @@ impl TryFrom<&str> for CompactCStr8 {
 
     /// Converts a `&str` into a `CompactCStr8`.
     ///
-    /// Equivalent to [`CompactCStr8::new`] but uses the standard
-    /// `TryFrom` trait. Fails if the string contains interior NUL bytes.
+    /// Equivalent to [`CompactCStr8::new`]. Fails if the string contains
+    /// interior NUL bytes.
     #[inline]
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         Self::from_utf8(s.as_bytes())
@@ -481,7 +478,11 @@ impl PartialEq<CompactCStr8> for CStr8 {
 mod tests {
     #[allow(unused_imports)]
     use crate::CStr8;
-    use {super::*, crate::cstr8, alloc::collections::BTreeMap};
+    use {
+        super::*,
+        crate::cstr8,
+        alloc::{borrow::ToOwned, collections::BTreeMap, vec},
+    };
 
     extern crate std;
     use std::collections::HashMap;
@@ -808,18 +809,108 @@ mod tests {
         assert_eq!(a.cmp(&b), cstr8!("aaa").cmp(cstr8!("bbb")));
     }
 
+    #[test]
+    fn cstr8_to_owned_no_double_nul() {
+        // Regression: ToOwned previously used from_vec_unchecked which
+        // appends a NUL, but the input already had one → double NUL.
+        let s = cstr8!("hello");
+        let owned = s.to_owned();
+        assert_eq!(owned.as_str(), "hello");
+        assert_eq!(owned.as_bytes_with_nul(), b"hello\0");
+    }
+
+    #[test]
+    fn from_utf8_nul_error_is_accurate() {
+        // The NUL error should report the actual position of the NUL byte,
+        // not a fabricated position 0.
+        let err = CompactCStr8::from_utf8(b"hel\0lo").unwrap_err();
+        match &err {
+            CStr8Error::NulError(inner) => {
+                let inner_msg = alloc::format!("{inner:?}");
+                assert!(
+                    inner_msg.contains("position: 3"),
+                    "error should report position 3 for NUL at byte 3: {inner_msg}"
+                );
+            },
+            other => panic!("expected NulError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_utf8_nul_error_long_is_accurate() {
+        // Same test but for the heap path (> MAX_INLINE_LEN).
+        let mut input = vec![b'a'; MAX_INLINE_LEN + 5];
+        let nul_pos = MAX_INLINE_LEN + 2;
+        input[nul_pos] = 0;
+        let err = CompactCStr8::from_utf8(&input).unwrap_err();
+        match &err {
+            CStr8Error::NulError(inner) => {
+                let inner_msg = alloc::format!("{inner:?}");
+                assert!(
+                    inner_msg.contains(&alloc::format!("position: {nul_pos}")),
+                    "heap-path error should report position {nul_pos}: {inner_msg}"
+                );
+            },
+            other => panic!("expected NulError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_returns_cstr8_error() {
+        // new() should return CStr8Error, same as TryFrom<&str>.
+        let err_new = CompactCStr8::new("has\0nul").unwrap_err();
+        let err_try: CStr8Error = CompactCStr8::try_from("has\0nul").unwrap_err();
+        assert!(
+            matches!(err_new, CStr8Error::NulError(_)),
+            "new() should return CStr8Error::NulError"
+        );
+        assert!(
+            matches!(err_try, CStr8Error::NulError(_)),
+            "try_from() should return CStr8Error::NulError"
+        );
+    }
+
+    #[test]
+    fn to_owned_roundtrip_long() {
+        // Verify to_owned works for strings that go through the Arc path.
+        let input = "a_long_string_that_definitely_exceeds_inline";
+        let compact = CompactCStr8::new(input).unwrap();
+        let owned = compact.to_owned();
+        assert_eq!(owned.as_str(), input);
+        assert_eq!(owned.as_bytes_with_nul().last(), Some(&0));
+        // Only one NUL at the end.
+        assert_eq!(
+            owned
+                .as_bytes_with_nul()
+                .iter()
+                .filter(|&&b| b == 0)
+                .count(),
+            1
+        );
+    }
+
     mod proptests {
         use {super::*, proptest::prelude::*};
 
         /// Strategy that generates valid UTF-8 strings without interior NUL bytes.
+        ///
+        /// Combines ASCII-heavy generation with proptest's string regex
+        /// to get diverse UTF-8 coverage including multibyte characters.
         fn valid_str() -> impl Strategy<Value = std::string::String> {
-            // Use a regex that avoids NUL bytes. proptest's default string
-            // strategy can produce NUL, so we filter or use a safe alphabet
-            // combined with arbitrary lengths.
-            prop::collection::vec(1u8..=255, 0..=80)
-                .prop_filter_map("must be valid UTF-8", |bytes| {
-                    std::string::String::from_utf8(bytes).ok()
-                })
+            prop_oneof![
+                // ASCII-heavy path: good for exercising inline storage.
+                prop::collection::vec(1u8..=127, 0..=80)
+                    .prop_filter_map("must be valid UTF-8", |bytes| {
+                        std::string::String::from_utf8(bytes).ok()
+                    }),
+                // Full byte range: exercises multibyte UTF-8 sequences.
+                prop::collection::vec(1u8..=255, 0..=80)
+                    .prop_filter_map("must be valid UTF-8", |bytes| {
+                        std::string::String::from_utf8(bytes).ok()
+                    }),
+                // Regex-based: ensures diverse multibyte UTF-8 (emoji, CJK, etc.)
+                "[^\x00]{0,40}",
+            ]
         }
 
         /// Strategy biased toward the inline/Arc boundary (lengths 19-25).
@@ -1045,6 +1136,82 @@ mod tests {
                 let arc: Arc<CStr8> = compact.into();
                 prop_assert_eq!(arc.as_ptr(), ptr,
                     "into Arc from Arc variant must reuse allocation");
+            }
+
+            #[test]
+            fn to_owned_roundtrip(s in valid_str()) {
+                let compact = CompactCStr8::new(&s).unwrap();
+                let owned = compact.to_owned();
+                prop_assert_eq!(owned.as_str(), s.as_str());
+                prop_assert_eq!(owned.as_bytes_with_nul().last(), Some(&0u8));
+                // Exactly one NUL byte, at the end.
+                let nul_count = owned.as_bytes_with_nul().iter().filter(|&&b| b == 0).count();
+                prop_assert_eq!(nul_count, 1, "to_owned must produce exactly one NUL");
+            }
+
+            #[test]
+            fn to_owned_via_cstr8_roundtrip(s in valid_str()) {
+                // Test ToOwned on &CStr8 directly (the fixed impl).
+                let cstring8 = CString8::new(&s).unwrap();
+                let cstr8_ref: &CStr8 = &cstring8;
+                let owned = cstr8_ref.to_owned();
+                prop_assert_eq!(owned.as_str(), s.as_str());
+                let nul_count = owned.as_bytes_with_nul().iter().filter(|&&b| b == 0).count();
+                prop_assert_eq!(nul_count, 1, "CStr8::to_owned must produce exactly one NUL");
+            }
+
+            #[test]
+            fn new_and_try_from_str_agree(s in valid_str()) {
+                // new() and TryFrom<&str> should always agree.
+                let from_new = CompactCStr8::new(&s).unwrap();
+                let from_try: CompactCStr8 = CompactCStr8::try_from(s.as_str()).unwrap();
+                prop_assert_eq!(from_new.is_inline(), from_try.is_inline());
+                prop_assert_eq!(from_new, from_try);
+            }
+
+            #[test]
+            fn from_utf8_rejects_nul_at_any_inline_position(pos in 0usize..MAX_INLINE_LEN) {
+                // Place a NUL at every possible inline position.
+                let mut bytes = vec![b'x'; MAX_INLINE_LEN];
+                bytes[pos] = 0;
+                let result = CompactCStr8::from_utf8(&bytes);
+                prop_assert!(result.is_err(),
+                    "NUL at position {pos} should be rejected");
+            }
+
+            #[test]
+            fn from_utf8_rejects_nul_in_heap_range(
+                len in (MAX_INLINE_LEN + 1)..=60usize,
+                pos_frac in 0.0f64..1.0,
+            ) {
+                let pos = (pos_frac * (len as f64)) as usize;
+                let pos = pos.min(len - 1);
+                let mut bytes = vec![b'x'; len];
+                bytes[pos] = 0;
+                let result = CompactCStr8::from_utf8(&bytes);
+                prop_assert!(result.is_err(),
+                    "NUL at position {pos} in {len}-byte input should be rejected");
+            }
+
+            #[test]
+            fn multibyte_utf8_roundtrip(s in "[^\x00]{0,40}") {
+                // Exercises emoji, CJK, combining characters, etc.
+                let compact = CompactCStr8::new(&s).unwrap();
+                prop_assert_eq!(compact.as_str(), s.as_str());
+                // Verify inline/arc threshold is by byte length, not char count.
+                if s.len() <= MAX_INLINE_LEN {
+                    prop_assert!(compact.is_inline());
+                } else {
+                    prop_assert!(!compact.is_inline());
+                }
+            }
+
+            #[test]
+            fn boundary_multibyte_utf8(s in "[^\x00]{4,8}") {
+                // Multibyte chars near the boundary: 4-8 chars could be
+                // 4-32 bytes depending on encoding.
+                let compact = CompactCStr8::new(&s).unwrap();
+                prop_assert_eq!(compact.as_str(), s.as_str());
             }
         }
     }

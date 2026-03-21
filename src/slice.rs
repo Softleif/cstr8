@@ -259,8 +259,9 @@ mod alloc_impls {
         type Owned = CString8;
 
         fn to_owned(&self) -> CString8 {
-            // SAFETY: The single nul terminator is maintained.
-            unsafe { CString8::from_vec_unchecked(self.as_bytes_with_nul().to_owned()) }
+            // SAFETY: as_bytes_with_nul() is valid UTF-8 with exactly one
+            // trailing NUL and no interior NULs (CStr8 invariant).
+            unsafe { CString8::from_vec_with_nul_unchecked(self.as_bytes_with_nul().to_owned()) }
         }
 
         // fn clone_into(&self, target: &mut CString8) {
